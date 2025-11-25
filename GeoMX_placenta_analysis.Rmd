@@ -1,0 +1,312 @@
+---
+title: "GeoMX_placenta_analysis"
+author: "Jose J Moreno-Villena"
+date: "2025-11-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Placenta Spatial Transcriptome analysis using GeoMx Digital Spatial Profiler 
+
+##GeoMX experiment at Queens Mary University London. The GeoMX NGS pipeline was run by the QMUL facility. This analysis begin with DCC files (digital count conversion files)
+
+###Followed the vignette: 
+####https://bioconductor.org/packages/release/workflows/vignettes/GeoMxWorkflows/inst/doc/GeomxTools_RNA-NGS_Analysis.html
+
+
+##### install and load the GeoMx packages
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+# The following initializes most up to date version of Bioc
+BiocManager::install()
+
+BiocManager::install("NanoStringNCTools")
+BiocManager::install("GeomxTools")
+BiocManager::install("GeoMxWorkflows")
+
+library(NanoStringNCTools)
+library(GeomxTools)
+library(GeoMxWorkflows)
+```
+
+
+Loading Data
+
+```{r}
+#the DataLocation folder should contain a dccs, pkcs, and annotation
+mydatadir <- file.path("~/ucl/science/current_projects/Spatial_comparison/qmul_analysis")
+
+# automatically list files in each directory for use
+myDCCFiles <- dir(file.path(mydatadir,"DCC-20230921"), pattern = ".dcc$",
+                full.names = TRUE, recursive = TRUE)
+
+# probe assay metadata describing the gene targets present in the data
+myPKCFiles <- paste0(mydatadir, "/Hsa_WTA_v1.0.pkc")
+
+# Sample metadata (has to be an excel file) 
+mySampleAnnotationFile <- file.path(mydatadir,"GC-TX-10347_sample_attributes_v2.xlsx")
+
+# load data
+myData <-
+  readNanoStringGeoMxSet(dccFiles = myDCCFiles,
+                         pkcFiles = myPKCFiles,
+                         phenoDataFile = mySampleAnnotationFile,
+                         phenoDataSheet = "Template",
+                         phenoDataDccColName = "Sample_ID",
+                         protocolDataColNames = c("aoi", "roi"),
+                         experimentDataColNames = c("panel"))
+
+
+```
+
+Sample Overview: Sankey plot
+
+```{r}
+#####
+library(dplyr)
+library(ggforce)
+library(networkD3)
+
+sankeyCols <- c("source", "target", "value")
+
+link1 <- count(pData(myData), GA,Condition)
+link2 <- count(pData(myData),  Condition, ROIsampleID)
+link3 <- count(pData(myData),  ROIsampleID, ROISubsection)
+
+colnames(link1) <- sankeyCols
+colnames(link2) <- sankeyCols
+colnames(link3) <- sankeyCols
+
+links <- rbind(link1,link2,link3)
+nodes <- unique(data.frame(name=c(links$source, links$target)))
+
+# sankeyNetwork is 0 based, not 1 based
+links$source <- as.integer(match(links$source,nodes$name)-1)
+links$target <- as.integer(match(links$target,nodes$name)-1)
+
+
+sankeyNetwork(Links = links, Nodes = nodes, Source = "source",
+              Target = "target", Value = "value", NodeID = "name",
+              units = "TWh", fontSize = 12, nodeWidth = 30)
+
+```
+
+QC & Pre-processing
+
+```{r}
+# Shift counts to one
+myData <- shiftCountsOne(myData, useDALogic = TRUE)
+
+
+# Default QC cutoffs are commented in () adjacent to the respective parameters
+# study-specific values were selected after visualizing the QC results in more
+# detail below
+QC_params <-
+  list(minSegmentReads = 1000, # Minimum number of reads (1000)
+       percentTrimmed = 80,    # Minimum % of reads trimmed (80%)
+       percentStitched = 80,   # Minimum % of reads stitched (80%)
+       percentAligned = 75,    # Minimum % of reads aligned (80%)
+       percentSaturation = 50, # Minimum sequencing saturation (50%)
+       minNegativeCount = 1,   # Minimum negative control counts (10)
+       maxNTCCount = 9000,     # Maximum counts observed in NTC well (1000)
+       minNuclei = 20,         # Minimum # of nuclei estimated (100)
+       minArea = 1000)         # Minimum segment area (5000)
+
+myData <-
+  setSegmentQCFlags(myData, 
+                    qcCutoffs = QC_params)   
+
+
+# Collate QC Results
+QCResults <- protocolData(myData)[["QCFlags"]]
+flag_columns <- colnames(QCResults)
+QC_Summary <- data.frame(Pass = colSums(!QCResults[, flag_columns]),
+                         Warning = colSums(QCResults[, flag_columns]))
+QCResults$QCStatus <- apply(QCResults, 1L, function(x) {
+  ifelse(sum(x) == 0L, "PASS", "WARNING")
+})
+QC_Summary["TOTAL FLAGS", ] <-
+  c(sum(QCResults[, "QCStatus"] == "PASS"),
+    sum(QCResults[, "QCStatus"] == "WARNING"))
+
+# Plot all of the QC Summary information in a table.
+kable(QC_Summary, caption = "QC Summary Table for each Segment")
+
+
+```
+
+Remove flagged segments
+
+```{r}
+
+myData <- myData[, QCResults$QCStatus == "PASS"]
+
+# Subsetting our dataset has removed samples which did not pass QC
+dim(myData)
+
+```
+
+Probe QC: remove low-performing probes
+A probe is removed globally from the dataset if either of the following is true:
+
+    the geometric mean of that probe’s counts from all segments divided by the geometric mean of all probe counts representing the target from all segments is less than 0.1
+    the probe is an outlier according to the Grubb’s test in at least 20% of the segments
+
+A probe is removed locally (from a given segment) if the probe is an outlier according to the Grubb’s test in that segment.
+```{r}
+
+# Generally keep the qcCutoffs parameters unchanged. Set removeLocalOutliers to 
+# FALSE if you do not want to remove local outliers
+myData <- setBioProbeQCFlags(myData, 
+                               qcCutoffs = list(minProbeRatio = 0.1,
+                                                percentFailGrubbs = 20), 
+                               removeLocalOutliers = TRUE)
+
+ProbeQCResults <- fData(myData)[["QCFlags"]]
+
+# Define QC table for Probe QC
+qc_df <- data.frame(Passed = sum(rowSums(ProbeQCResults[, -1]) == 0),
+                    Global = sum(ProbeQCResults$GlobalGrubbsOutlier),
+                    Local = sum(rowSums(ProbeQCResults[, -2:-1]) > 0
+                                & !ProbeQCResults$GlobalGrubbsOutlier))
+
+qc_df 
+
+#Subset object to exclude all that did not pass Ratio & Global testing
+ProbeQCPassed <- 
+  subset(myData, 
+         fData(myData)[["QCFlags"]][,c("LowProbeRatio")] == FALSE &
+           fData(myData)[["QCFlags"]][,c("GlobalGrubbsOutlier")] == FALSE)
+dim(ProbeQCPassed)
+#> Features  Samples 
+#>    18641      229
+myData <- ProbeQCPassed 
+
+```
+
+Create Gene-level Count Data
+
+```{r}
+# Check how many unique targets the object has
+length(unique(featureData(myData)[["TargetName"]]))
+#> [1] 18504
+
+# collapse to targets
+target_myData <- aggregateCounts(myData)
+dim(target_myData)
+
+exprs(target_myData)[1:5, 1:2]
+```
+
+Limit of Quantification & Filtering: determine the limit of quantification (LOQ) per segment. The LOQ is calculated based on the distribution of negative control probes and is intended to approximate the quantifiable limit of gene expression per segment. 
+
+
+```{r}
+#####
+
+# Define LOQ SD threshold and minimum value
+cutoff <- 2
+minLOQ <- 2
+
+# Calculate LOQ per module tested
+LOQ <- data.frame(row.names = colnames(target_myData))
+for(module in modules) {
+  vars <- paste0(c("NegGeoMean_", "NegGeoSD_"),
+                 module)
+  if(all(vars[1:2] %in% colnames(pData(target_myData)))) {
+    LOQ[, module] <-
+      pmax(minLOQ,
+           pData(target_myData)[, vars[1]] * 
+             pData(target_myData)[, vars[2]] ^ cutoff)
+  }
+}
+pData(target_myData)$LOQ <- LOQ
+
+# Filtering: 
+LOQ_Mat <- c()
+for(module in modules) {
+  ind <- fData(target_myData)$Module == module
+  Mat_i <- t(esApply(target_myData[ind, ], MARGIN = 1,
+                     FUN = function(x) {
+                       x > LOQ[, module]
+                     }))
+  LOQ_Mat <- rbind(LOQ_Mat, Mat_i)
+}
+# ensure ordering since this is stored outside of the geomxSet
+LOQ_Mat <- LOQ_Mat[fData(target_myData)$TargetName, ]
+
+
+
+# Save detection rate information to pheno data
+pData(target_myData)$GenesDetected <- 
+  colSums(LOQ_Mat, na.rm = TRUE)
+pData(target_myData)$GeneDetectionRate <-
+  pData(target_myData)$GenesDetected / nrow(target_myData)
+
+# Determine detection thresholds: 1%, 5%, 10%, 15%, >15%
+pData(target_myData)$DetectionThreshold <- 
+  cut(pData(target_myData)$GeneDetectionRate,
+      breaks = c(0, 0.01, 0.05, 0.1, 0.15, 1),
+      labels = c("<1%", "1-5%", "5-10%", "10-15%", ">15%"))
+
+# stacked bar plot of different cut points (1%, 5%, 10%, 15%)
+ggplot(pData(target_myData),
+       aes(x = DetectionThreshold)) +
+  geom_bar(aes(fill = ROISubsection)) +
+  geom_text(stat = "count", aes(label = ..count..), vjust = -0.5) +
+  theme_bw() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = "Gene Detection Rate",
+       y = "Segments, #",
+       fill = "Segment Type")
+
+```
+
+Remove segments with less than 10% of the genes detected. 
+
+```{r}
+target_myData <-
+  target_myData[, pData(target_myData)$GeneDetectionRate >= .1]
+
+dim(target_myData)
+```
+
+None is removed
+
+
+Gene Filtering
+
+```{r}
+# Subset to target genes detected in at least 10% of the samples.
+#   Also manually include the negative control probe, for downstream use
+negativeProbefData <- subset(fData(target_myData), CodeClass == "Negative")
+neg_probes <- unique(negativeProbefData$TargetName)
+target_myData <- 
+  target_myData[fData(target_myData)$DetectionRate >= 0.1 |
+                    fData(target_myData)$TargetName %in% neg_probes, ]
+dim(target_myData)
+
+```
+
+
+Normalization
+```{r}
+###
+# Q3 norm (75th percentile) for WTA/CTA  with or without custom spike-ins
+target_myData <- normalize(target_myData ,
+                             norm_method = "quant", 
+                             desiredQuantile = .75,
+                             toElt = "q_norm")
+
+# Background normalization for WTA/CTA without custom spike-in
+target_myData <- normalize(target_myData ,
+                             norm_method = "neg", 
+                             fromElt = "exprs",
+                             toElt = "neg_norm")
+```
+
